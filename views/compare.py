@@ -30,9 +30,13 @@ def scrape_and_process(url: str, max_pages: int) -> dict:
         "name":          name,
         "review_count":  len(df),
         "avg_sentiment": round(float(df["sentiment_score"].mean()), 3),
+        "avg_sentiment_blended": round(float(df["sentiment_score_blended"].mean()), 3) if "sentiment_score_blended" in df.columns else round(float(df["sentiment_score"].mean()), 3),
         "avg_rating":    round(float(df["rating"].mean()), 2) if "rating" in df.columns else None,
+        "has_ratings":   "rating" in df.columns and df["rating"].notna().any(),
         "pct_positive":  round(float((df["sentiment_label"] == "Positive").mean()) * 100, 1),
         "pct_negative":  round(float((df["sentiment_label"] == "Negative").mean()) * 100, 1),
+        "pct_positive_blended":  round(float((df["sentiment_label_blended"] == "Positive").mean()) * 100, 1) if "sentiment_label_blended" in df.columns else round(float((df["sentiment_label"] == "Positive").mean()) * 100, 1),
+        "pct_negative_blended":  round(float((df["sentiment_label_blended"] == "Negative").mean()) * 100, 1) if "sentiment_label_blended" in df.columns else round(float((df["sentiment_label"] == "Negative").mean()) * 100, 1),
         "sample_reviews": (
             df.nlargest(3, "sentiment_score")["review_text"].tolist() +
             df.nsmallest(2, "sentiment_score")["review_text"].tolist()
@@ -44,8 +48,10 @@ def scrape_and_process(url: str, max_pages: int) -> dict:
         mentioning = df[df[tc] > 0]  # any keyword hit counts as a mention
         if len(mentioning) > 0:
             feature[f"{tc}_sentiment"] = round(float(mentioning["sentiment_score"].mean()), 3)
+            feature[f"{tc}_sentiment_blended"] = round(float(mentioning["sentiment_score_blended"].mean()), 3) if "sentiment_score_blended" in mentioning.columns else feature[f"{tc}_sentiment"]
         else:
             feature[f"{tc}_sentiment"] = 0.0
+            feature[f"{tc}_sentiment_blended"] = 0.0
 
     return feature
 
@@ -100,9 +106,43 @@ def render(add_clicked: bool, compare_urls: list, compare_pages: int):
 
     st.markdown("---")
 
+    # ── Sentiment blend toggle ──
+    any_has_ratings = any(co.get("has_ratings", False) for co in companies)
+    if any_has_ratings:
+        use_blended = st.toggle(
+            "⭐ Blend star rating into sentiment score",
+            value=True,
+            key="compare_use_blended_sentiment",
+            help=(
+                "When ON, sentiment = 50% NLP model + 50% star rating (normalized to −1…+1). "
+                "When OFF, only the NLP model score is used."
+            ),
+        )
+        if use_blended:
+            st.caption(
+                "⭐ **Blended mode active** — sentiment = 50% DistilBERT NLP + 50% star rating "
+                "(1★ → −1.0 · 3★ → 0.0 · 5★ → +1.0)"
+            )
+    else:
+        use_blended = False
+
     # ── Build aggregated dataframe ──
     theme_cols = list(THEME_KEYWORDS.keys())
     co_df = pd.DataFrame(companies)
+    # Use blended or raw sentiment columns depending on toggle
+    if use_blended:
+        if "avg_sentiment_blended" in co_df.columns:
+            co_df["avg_sentiment"] = co_df["avg_sentiment_blended"]
+        if "pct_positive_blended" in co_df.columns:
+            co_df["pct_positive"] = co_df["pct_positive_blended"]
+        if "pct_negative_blended" in co_df.columns:
+            co_df["pct_negative"] = co_df["pct_negative_blended"]
+        # Swap per-topic sentiment cols
+        for tc in theme_cols:
+            blended_col = f"{tc}_sentiment_blended"
+            if blended_col in co_df.columns:
+                co_df[f"{tc}_sentiment"] = co_df[blended_col]
+
     co_df = _add_pca_coords(co_df, theme_cols)
     variance = co_df.attrs.get("variance", [0.0, 0.0])
     feature_cols = co_df.attrs.get("feature_cols", [])
@@ -117,13 +157,13 @@ def render(add_clicked: bool, compare_urls: list, compare_pages: int):
         _tab_map(co_df, variance, feature_cols)
 
     with ctab2:
-        _tab_topics(co_df, theme_cols)
+        _tab_topics(co_df, theme_cols, use_blended=use_blended)
 
     with ctab3:
-        _tab_sentiment(co_df)
+        _tab_sentiment(co_df, use_blended=use_blended)
 
     with ctab4:
-        _tab_rankings(co_df)
+        _tab_rankings(co_df, use_blended=use_blended)
 
 
 # ─────────────────────────────────────────────
@@ -214,13 +254,15 @@ def _tab_map(co_df: pd.DataFrame, variance: list, feature_cols: list = None):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _tab_topics(co_df: pd.DataFrame, theme_cols: list):
-    st.subheader("Topic Sentiment & Volume")
+def _tab_topics(co_df: pd.DataFrame, theme_cols: list, use_blended: bool = False):
+    title = "Topic Sentiment & Volume ⭐" if use_blended else "Topic Sentiment & Volume"
+    st.subheader(title)
+    blend_note = " Scores blend NLP + star rating." if use_blended else ""
     st.caption(
         "Each bubble is one company × topic. "
         "**Y axis** = sentiment (higher = more positive). "
         "**Size** = how often the topic is mentioned. "
-        "Hover for exact values."
+        "Hover for exact values." + blend_note
     )
 
     import plotly.graph_objects as go
@@ -308,8 +350,11 @@ def _tab_topics(co_df: pd.DataFrame, theme_cols: list):
     st.caption("Bigger bubble = topic mentioned more. Hover any bubble for exact figures.")
 
 
-def _tab_sentiment(co_df: pd.DataFrame):
-    st.subheader("Sentiment Comparison")
+def _tab_sentiment(co_df: pd.DataFrame, use_blended: bool = False):
+    title = "Sentiment Comparison ⭐" if use_blended else "Sentiment Comparison"
+    st.subheader(title)
+    if use_blended:
+        st.caption("Scores shown are blended: 50% NLP model + 50% star rating (1★=−1 · 3★=0 · 5★=+1).")
     scol1, scol2 = st.columns(2)
 
     with scol1:
@@ -338,8 +383,9 @@ def _tab_sentiment(co_df: pd.DataFrame):
         st.plotly_chart(fig_pos, use_container_width=True)
 
 
-def _tab_rankings(co_df: pd.DataFrame):
-    st.subheader("Company Rankings")
+def _tab_rankings(co_df: pd.DataFrame, use_blended: bool = False):
+    title = "Company Rankings ⭐" if use_blended else "Company Rankings"
+    st.subheader(title)
 
     rank_df = co_df[["name", "avg_sentiment", "avg_rating", "pct_positive", "review_count"]].copy()
     rank_df.columns = ["Company", "Avg Sentiment", "Avg Rating", "% Positive", "Reviews"]

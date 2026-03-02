@@ -125,6 +125,47 @@ def extract_signals(df: pd.DataFrame, progress_callback=None) -> pd.DataFrame:
 
     theme_scores = df["review_text"].apply(get_theme_scores).apply(pd.Series)
     df = pd.concat([df, theme_scores], axis=1)
+
+    # Pre-compute blended score (NLP + star rating), stored alongside raw score
+    df = blend_sentiment_with_rating(df)
+    return df
+
+
+def blend_sentiment_with_rating(df: pd.DataFrame, nlp_weight: float = 0.5) -> pd.DataFrame:
+    """
+    Compute a blended sentiment score that combines the NLP model score with
+    the star rating (normalized to [-1, +1]).
+
+    Star rating normalization: (rating - 3) / 2  →  1★ = -1.0, 3★ = 0.0, 5★ = 1.0
+
+    If no rating column exists (or all ratings are NaN), the blended score
+    equals the raw NLP score so the toggle still works safely.
+
+    Both scores are always computed and stored:
+      - sentiment_score         : raw DistilBERT score
+      - sentiment_score_blended : weighted average with star rating
+    """
+    df = df.copy()
+    has_ratings = (
+        "rating" in df.columns
+        and pd.to_numeric(df["rating"], errors="coerce").notna().any()
+    )
+
+    if has_ratings:
+        rating_norm = (pd.to_numeric(df["rating"], errors="coerce") - 3) / 2
+        rating_weight = 1.0 - nlp_weight
+        # Where rating is missing, fall back to pure NLP score
+        blended = np.where(
+            rating_norm.notna(),
+            nlp_weight * df["sentiment_score"] + rating_weight * rating_norm,
+            df["sentiment_score"],
+        )
+        df["sentiment_score_blended"] = np.clip(np.round(blended, 4), -1.0, 1.0)
+    else:
+        # No ratings available — blended == raw so code downstream never breaks
+        df["sentiment_score_blended"] = df["sentiment_score"]
+
+    df["sentiment_label_blended"] = df["sentiment_score_blended"].apply(get_sentiment_label)
     return df
 
 
@@ -292,7 +333,17 @@ def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
         cdf = df[df["cluster"] == cluster_id]
 
         avg_sentiment = cdf["sentiment_score"].mean()
+        avg_sentiment_blended = (
+            cdf["sentiment_score_blended"].mean()
+            if "sentiment_score_blended" in cdf.columns
+            else avg_sentiment
+        )
         sentiment_counts = cdf["sentiment_label"].value_counts().to_dict()
+        sentiment_counts_blended = (
+            cdf["sentiment_label_blended"].value_counts().to_dict()
+            if "sentiment_label_blended" in cdf.columns
+            else sentiment_counts
+        )
         top_words = get_top_words(cdf, tfidf)
         name, sentiment_tag = name_cluster(cdf, top_words)
         avg_rating = cdf["rating"].mean() if "rating" in cdf.columns else None
@@ -300,15 +351,17 @@ def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
                          cdf.nsmallest(2, "sentiment_score")["review_text"].tolist()
 
         summaries.append({
-            "cluster_id":       cluster_id,
-            "name":             name,
-            "sentiment_tag":    sentiment_tag,
-            "review_count":     len(cdf),
-            "avg_sentiment":    round(avg_sentiment, 3),
-            "avg_rating":       round(avg_rating, 2) if avg_rating is not None else None,
-            "sentiment_counts": sentiment_counts,
-            "top_words":        top_words,
-            "sample_reviews":   sample_reviews[:5],
+            "cluster_id":              cluster_id,
+            "name":                    name,
+            "sentiment_tag":           sentiment_tag,
+            "review_count":            len(cdf),
+            "avg_sentiment":           round(avg_sentiment, 3),
+            "avg_sentiment_blended":   round(avg_sentiment_blended, 3),
+            "avg_rating":              round(avg_rating, 2) if avg_rating is not None else None,
+            "sentiment_counts":        sentiment_counts,
+            "sentiment_counts_blended": sentiment_counts_blended,
+            "top_words":               top_words,
+            "sample_reviews":          sample_reviews[:5],
         })
 
     summaries = deduplicate_names(summaries)

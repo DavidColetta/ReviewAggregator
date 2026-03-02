@@ -116,8 +116,32 @@ def render(data_source: str, business_name: str, trustpilot_url: str,
     else:
         st.caption(f"🎯 Using **K = {final_k}** — set manually. Elbow analysis recommends K = {optimal_k}.")
 
+    # ── Sentiment blend toggle ──
+    has_ratings = "rating" in df.columns and df["rating"].notna().any()
+    if has_ratings:
+        use_blended = st.toggle(
+            "⭐ Blend star rating into sentiment score",
+            value=True,
+            key="use_blended_sentiment",
+            help=(
+                "When ON, the sentiment score is a 50/50 weighted average of the DistilBERT NLP "
+                "score and the star rating normalized to −1…+1 (1★=−1, 3★=0, 5★=+1). "
+                "When OFF, only the NLP model score is used."
+            ),
+        )
+        if use_blended:
+            st.caption(
+                "⭐ **Blended mode active** — sentiment = 50% DistilBERT NLP + 50% star rating "
+                "(1★ → −1.0 · 3★ → 0.0 · 5★ → +1.0)"
+            )
+    else:
+        use_blended = False
+
+    score_col = "sentiment_score_blended" if use_blended else "sentiment_score"
+    label_col = "sentiment_label_blended" if use_blended else "sentiment_label"
+
     # ── Top metrics ──
-    _render_metrics(df, business_name, summaries)
+    _render_metrics(df, business_name, summaries, score_col=score_col, label_col=label_col, use_blended=use_blended)
 
     st.markdown("---")
 
@@ -128,13 +152,13 @@ def render(data_source: str, business_name: str, trustpilot_url: str,
     ])
 
     with tab1:
-        _tab_clusters(summaries)
+        _tab_clusters(summaries, use_blended=use_blended)
 
     with tab2:
         _tab_review_map(df, summaries, pca_meta)
 
     with tab3:
-        _tab_sentiment(df, summaries)
+        _tab_sentiment(df, summaries, score_col=score_col, label_col=label_col, use_blended=use_blended)
 
     with tab4:
         _tab_pipeline(elbow_result, pca_meta)
@@ -178,15 +202,24 @@ def _render_quality_report(raw_df: pd.DataFrame):
             st.success("✅ All reviews passed quality checks.")
 
 
-def _render_metrics(df: pd.DataFrame, business_name: str, summaries: list):
+def _render_metrics(
+    df: pd.DataFrame, business_name: str, summaries: list,
+    score_col: str = "sentiment_score",
+    label_col: str = "sentiment_label",
+    use_blended: bool = False,
+):
     has_ratings = "rating" in df.columns and df["rating"].notna().any()
-    pct_positive = (df["sentiment_label"] == "Positive").mean() * 100
-    pct_negative = (df["sentiment_label"] == "Negative").mean() * 100
+    effective_label = df[label_col] if label_col in df.columns else df["sentiment_label"]
+    pct_positive = (effective_label == "Positive").mean() * 100
+    pct_negative = (effective_label == "Negative").mean() * 100
+
+    pos_label = "Positive ⭐" if use_blended else "Positive"
+    neg_label = "Negative ⭐" if use_blended else "Negative"
 
     cols = st.columns([1, 1, 1, 1, 1.2])
     cols[0].metric("Total Reviews", f"{len(df):,}")
-    cols[1].metric("Positive", f"{pct_positive:.0f}%")
-    cols[2].metric("Negative", f"{pct_negative:.0f}%")
+    cols[1].metric(pos_label, f"{pct_positive:.0f}%")
+    cols[2].metric(neg_label, f"{pct_negative:.0f}%")
     if has_ratings:
         cols[3].metric("Avg Star Rating", f"{df['rating'].mean():.1f} ★")
 
@@ -199,11 +232,17 @@ def _render_metrics(df: pd.DataFrame, business_name: str, summaries: list):
     )
 
 
-def _tab_clusters(summaries: list):
+def _tab_clusters(summaries: list, use_blended: bool = False):
     st.subheader("What customers are talking about")
     st.caption(f"Reviews grouped into {len(summaries)} themes by topic and sentiment.")
     for s in sorted(summaries, key=lambda x: x["review_count"], reverse=True):
-        st.markdown(cluster_card(s), unsafe_allow_html=True)
+        # Pass a copy with the active sentiment score so cluster_card renders correctly
+        s_display = s.copy()
+        if use_blended and "avg_sentiment_blended" in s:
+            s_display["avg_sentiment"] = s["avg_sentiment_blended"]
+        if use_blended and "sentiment_counts_blended" in s:
+            s_display["sentiment_counts"] = s["sentiment_counts_blended"]
+        st.markdown(cluster_card(s_display), unsafe_allow_html=True)
 
 
 def _tab_review_map(df: pd.DataFrame, summaries: list, pca_meta: dict):
@@ -250,13 +289,20 @@ def _tab_review_map(df: pd.DataFrame, summaries: list, pca_meta: dict):
                   help="How much variance each axis captures individually")
 
 
-def _tab_sentiment(df: pd.DataFrame, summaries: list):
+def _tab_sentiment(
+    df: pd.DataFrame, summaries: list,
+    score_col: str = "sentiment_score",
+    label_col: str = "sentiment_label",
+    use_blended: bool = False,
+):
     has_ratings = "rating" in df.columns and df["rating"].notna().any()
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("Overall Sentiment")
-        sent_counts = df["sentiment_label"].value_counts().to_dict()
+        title = "Overall Sentiment ⭐" if use_blended else "Overall Sentiment"
+        st.subheader(title)
+        active_label = df[label_col] if label_col in df.columns else df["sentiment_label"]
+        sent_counts = active_label.value_counts().to_dict()
         st.plotly_chart(sentiment_donut(sent_counts), use_container_width=True)
 
     with col_b:
@@ -264,27 +310,31 @@ def _tab_sentiment(df: pd.DataFrame, summaries: list):
             st.subheader("Rating Distribution")
             st.plotly_chart(rating_histogram(df["rating"]), use_container_width=True)
         else:
-            st.subheader("Sentiment Score Distribution")
+            active_score = score_col if score_col in df.columns else "sentiment_score"
+            dist_title = "Blended Sentiment Score Distribution" if use_blended else "Sentiment Score Distribution"
+            st.subheader(dist_title)
             fig_hist = px.histogram(
-                df, x="sentiment_score", nbins=20,
+                df, x=active_score, nbins=20,
                 color_discrete_sequence=["#2980b9"],
                 template="plotly_white",
-                labels={"sentiment_score": "Sentiment Score"},
+                labels={active_score: "Sentiment Score"},
             )
             fig_hist.update_layout(height=320, paper_bgcolor="#faf8f5",
                                    plot_bgcolor="#faf8f5", margin=dict(t=10))
             st.plotly_chart(fig_hist, use_container_width=True)
 
+    sentiment_col_label = "Sentiment ⭐" if use_blended else "Sentiment"
     st.subheader("Theme Summary")
     table_rows = []
     for s in sorted(summaries, key=lambda x: x["review_count"], reverse=True):
-        emoji = "🟢" if s["avg_sentiment"] >= 0.05 else ("🔴" if s["avg_sentiment"] <= -0.05 else "🟡")
+        active_sent = s.get("avg_sentiment_blended", s["avg_sentiment"]) if use_blended else s["avg_sentiment"]
+        emoji = "🟢" if active_sent >= 0.05 else ("🔴" if active_sent <= -0.05 else "🟡")
         table_rows.append({
-            "Theme":        s["name"],
-            "Reviews":      s["review_count"],
-            "Avg Rating":   f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
-            "Sentiment":    f"{emoji} {s['avg_sentiment']:+.2f}",
-            "Top Keywords": ", ".join(s["top_words"][:4]),
+            "Theme":              s["name"],
+            "Reviews":            s["review_count"],
+            "Avg Rating":         f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
+            sentiment_col_label:  f"{emoji} {active_sent:+.2f}",
+            "Top Keywords":       ", ".join(s["top_words"][:4]),
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
