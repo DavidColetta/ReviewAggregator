@@ -54,28 +54,32 @@ def scrape_and_process(url: str, max_pages: int) -> dict:
 # Main render function
 # ─────────────────────────────────────────────
 
-def render(add_clicked: bool, compare_url: str, compare_pages: int):
+def render(add_clicked: bool, compare_urls: list, compare_pages: int):
     """Entry point called from app.py."""
 
     st.markdown("# ⚖️ Compare Businesses")
     st.caption("Add companies via Trustpilot URLs. Each company becomes a bubble on the map.")
 
-    # ── Handle add button ──
-    if add_clicked and compare_url:
-        with st.spinner(f"Scraping and processing {compare_url}..."):
-            try:
-                feature = scrape_and_process(compare_url, compare_pages)
-                if "compare_companies" not in st.session_state:
-                    st.session_state.compare_companies = []
+    # ── Handle add button — process all URLs ──
+    if add_clicked and compare_urls:
+        if "compare_companies" not in st.session_state:
+            st.session_state.compare_companies = []
+        existing = [c["name"] for c in st.session_state.compare_companies]
 
-                existing = [c["name"] for c in st.session_state.compare_companies]
+        progress = st.progress(0, text=f"Scraping 0 / {len(compare_urls)} companies...")
+        for idx, url in enumerate(compare_urls):
+            progress.progress(idx / len(compare_urls), text=f"Scraping {url}...")
+            try:
+                feature = scrape_and_process(url, compare_pages)
                 if feature["name"] in existing:
-                    st.warning(f"**{feature['name']}** is already added.")
+                    st.warning(f"**{feature['name']}** is already added — skipped.")
                 else:
                     st.session_state.compare_companies.append(feature)
+                    existing.append(feature["name"])
                     st.success(f"Added **{feature['name']}** ({feature['review_count']} reviews)")
             except Exception as e:
-                st.error(f"Failed to scrape {compare_url}: {e}")
+                st.error(f"Failed to scrape {url}: {e}")
+        progress.empty()
 
     companies = st.session_state.get("compare_companies", [])
 
@@ -85,11 +89,23 @@ def render(add_clicked: bool, compare_url: str, compare_pages: int):
         st.info(f"👈 Add at least {remaining} more {noun} using the sidebar to start comparing.")
         return
 
+    # ── Companies list — rendered here so it always reflects latest state ──
+    st.markdown("**Companies in comparison:**")
+    for i, co in enumerate(st.session_state.compare_companies):
+        ccol1, ccol2 = st.columns([6, 1])
+        ccol1.info(f"📍 **{co['name']}** — {co['review_count']} reviews")
+        if ccol2.button("✕ Remove", key=f"remove_{i}"):
+            st.session_state.compare_companies.pop(i)
+            st.rerun()
+
+    st.markdown("---")
+
     # ── Build aggregated dataframe ──
     theme_cols = list(THEME_KEYWORDS.keys())
     co_df = pd.DataFrame(companies)
     co_df = _add_pca_coords(co_df, theme_cols)
     variance = co_df.attrs.get("variance", [0.0, 0.0])
+    feature_cols = co_df.attrs.get("feature_cols", [])
 
     # ── Tabs ──
     ctab1, ctab2, ctab3, ctab4 = st.tabs([
@@ -98,7 +114,7 @@ def render(add_clicked: bool, compare_url: str, compare_pages: int):
     ])
 
     with ctab1:
-        _tab_map(co_df, variance)
+        _tab_map(co_df, variance, feature_cols)
 
     with ctab2:
         _tab_topics(co_df, theme_cols)
@@ -115,8 +131,12 @@ def render(add_clicked: bool, compare_url: str, compare_pages: int):
 # ─────────────────────────────────────────────
 
 def _add_pca_coords(co_df: pd.DataFrame, theme_cols: list) -> pd.DataFrame:
-    feature_cols = ["avg_sentiment", "avg_rating"] + theme_cols
-    feature_cols = [c for c in feature_cols if c in co_df.columns and co_df[c].notna().all()]
+    # Use per-topic sentiment scores + overall sentiment + rating.
+    # This means position reflects *how companies are perceived* on each topic,
+    # not just how often they mention it.
+    sentiment_cols = [f"{tc}_sentiment" for tc in theme_cols]
+    candidate_cols = ["avg_sentiment", "avg_rating"] + sentiment_cols
+    feature_cols = [c for c in candidate_cols if c in co_df.columns and co_df[c].notna().all()]
 
     X = co_df[feature_cols].values
     X_scaled = StandardScaler().fit_transform(X)
@@ -129,6 +149,7 @@ def _add_pca_coords(co_df: pd.DataFrame, theme_cols: list) -> pd.DataFrame:
     co_df["pca_x"] = coords[:, 0]
     co_df["pca_y"] = coords[:, 1] if coords.shape[1] > 1 else 0.0
     co_df.attrs["variance"] = pca.explained_variance_ratio_.tolist()
+    co_df.attrs["feature_cols"] = feature_cols  # expose for display
     return co_df
 
 
@@ -136,11 +157,12 @@ def _add_pca_coords(co_df: pd.DataFrame, theme_cols: list) -> pd.DataFrame:
 # Tabs
 # ─────────────────────────────────────────────
 
-def _tab_map(co_df: pd.DataFrame, variance: list):
+def _tab_map(co_df: pd.DataFrame, variance: list, feature_cols: list = None):
     st.subheader("Company Landscape")
+    features_str = ", ".join(feature_cols) if feature_cols else "sentiment & topic scores"
     st.caption(
-        f"Position reflects review profile similarity. Size = review count. "
-        f"Chart captures {sum(variance):.0%} of variance."
+        f"Position reflects review profile similarity across: **{features_str}**. "
+        f"Chart captures {sum(variance):.0%} of variance. Size = review count."
     )
 
     fig = go.Figure()
@@ -193,86 +215,97 @@ def _tab_map(co_df: pd.DataFrame, variance: list):
 
 
 def _tab_topics(co_df: pd.DataFrame, theme_cols: list):
-    st.subheader("Topic Mentions vs Sentiment")
+    st.subheader("Topic Sentiment & Volume")
     st.caption(
         "Each bubble is one company × topic. "
-        "**X axis** = how often the topic is mentioned. "
-        "**Y axis** = sentiment among those mentions. "
-        "Bubbles above the line are praised; below are criticised."
+        "**Y axis** = sentiment (higher = more positive). "
+        "**Size** = how often the topic is mentioned. "
+        "Hover for exact values."
     )
 
     import plotly.graph_objects as go
+    import numpy as np
+
+    n_companies = len(co_df)
+    # Spread companies within each topic column using evenly spaced offsets
+    # so bubbles never overlap regardless of count
+    offsets = np.linspace(-0.3, 0.3, n_companies) if n_companies > 1 else [0.0]
+
+    # Compute global max mention rate for consistent bubble sizing
+    all_mention_rates = [
+        row.get(tc, 0.0)
+        for _, row in co_df.iterrows()
+        for tc in theme_cols
+    ]
+    max_mention = max(all_mention_rates) or 1.0
 
     fig = go.Figure()
 
-    # Reference lines
+    # Shaded sentiment regions
+    fig.add_hrect(y0=0, y1=1.1, fillcolor="#27ae60", opacity=0.04, line_width=0)
+    fig.add_hrect(y0=-1.1, y1=0, fillcolor="#c0392b", opacity=0.04, line_width=0)
     fig.add_hline(y=0, line_dash="dash", line_color="#ccc", line_width=1)
-    fig.add_hrect(y0=0, y1=1.1, fillcolor="#27ae60", opacity=0.03, line_width=0)
-    fig.add_hrect(y0=-1.1, y1=0, fillcolor="#c0392b", opacity=0.03, line_width=0)
 
-    for i, row in co_df.iterrows():
-        x_vals, y_vals, labels, hovers = [], [], [], []
-        for tc in theme_cols:
+    for i, (_, row) in enumerate(co_df.iterrows()):
+        x_vals, y_vals, sizes, hovers = [], [], [], []
+
+        for j, tc in enumerate(theme_cols):
             mention_rate = row.get(tc, 0.0)
             sentiment    = row.get(f"{tc}_sentiment", 0.0)
-            x_vals.append(mention_rate)
+            x_vals.append(j + offsets[i])       # topic index + company offset
             y_vals.append(sentiment)
-            labels.append(tc)
+            # Scale bubble size: min 10px, max 50px
+            size = 10 + 40 * (mention_rate / max_mention)
+            sizes.append(size)
             hovers.append(
-                f"<b>{row['name']}</b><br>"
-                f"Topic: {tc}<br>"
-                f"Mention rate: {mention_rate:.3f}<br>"
-                f"Sentiment: {sentiment:+.3f}"
+                f"<b>{row['name']}</b> — {tc}<br>"
+                f"Sentiment: {sentiment:+.3f}<br>"
+                f"Mention rate: {mention_rate:.3f}"
             )
 
         fig.add_trace(go.Scatter(
             x=x_vals,
             y=y_vals,
-            mode="markers+text",
+            mode="markers",
             name=row["name"],
             marker=dict(
-                size=18,
+                size=sizes,
                 color=COLORS[i % len(COLORS)],
                 opacity=0.8,
                 line=dict(width=1.5, color="white"),
             ),
-            text=labels,
-            textposition="top center",
-            textfont=dict(size=10, color="#333"),
             hovertemplate=[h + "<extra></extra>" for h in hovers],
         ))
 
     fig.update_layout(**base_layout(
-        height=520,
+        height=500,
         xaxis=dict(
-            title="Mention rate (higher = topic comes up more often)",
-            tickformat=".3f",
-            showgrid=True, gridcolor="#eee",
+            tickmode="array",
+            tickvals=list(range(len(theme_cols))),
+            ticktext=theme_cols,
+            showgrid=False,
+            zeroline=False,
         ),
         yaxis=dict(
-            title="Avg sentiment among mentions",
+            title="Sentiment among mentions",
             range=[-1.1, 1.1],
             zeroline=False,
             showgrid=True, gridcolor="#eee",
         ),
-        legend=dict(orientation="h", y=-0.18),
+        legend=dict(orientation="h", y=-0.15),
         margin=dict(t=20, b=60, l=20, r=20),
         annotations=[
-            dict(x=0, y=0.55, xref="paper", yref="paper",
-                 text="← Praised", showarrow=False,
-                 font=dict(color="#27ae60", size=11)),
-            dict(x=0, y=0.42, xref="paper", yref="paper",
-                 text="← Criticised", showarrow=False,
-                 font=dict(color="#c0392b", size=11)),
+            dict(xref="paper", yref="paper", x=1.01, y=0.75,
+                 text="▲ Praised", showarrow=False,
+                 font=dict(color="#27ae60", size=11), xanchor="left"),
+            dict(xref="paper", yref="paper", x=1.01, y=0.22,
+                 text="▼ Criticised", showarrow=False,
+                 font=dict(color="#c0392b", size=11), xanchor="left"),
         ],
     ))
 
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        "Topics near the right edge are frequently discussed. "
-        "Topics near the top are spoken about positively. "
-        "Bottom-right is the danger zone — talked about a lot, negatively."
-    )
+    st.caption("Bigger bubble = topic mentioned more. Hover any bubble for exact figures.")
 
 
 def _tab_sentiment(co_df: pd.DataFrame):

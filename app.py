@@ -39,6 +39,10 @@ with st.sidebar:
     if "compare_companies" not in st.session_state:
         st.session_state.compare_companies = []
 
+    # Safe defaults — only set in compare sidebar branch
+    add_clicked  = False
+    compare_urls = []
+
     def on_slider_change():
         st.session_state.k_override = True
 
@@ -96,33 +100,30 @@ with st.sidebar:
 
     # ── Compare sidebar ──
     else:
-        st.markdown("**Add a company**")
-        compare_url = st.text_input(
-            "Trustpilot URL or slug",
-            placeholder="e.g. pizzahut.com",
-            key="compare_url_input",
+        st.markdown("**Add companies**")
+        compare_urls_input = st.text_area(
+            "Trustpilot URLs or slugs",
+            placeholder="dominos.com\npizzahut.com\npapaJohns.com",
+            help="One URL or slug per line",
+            key="compare_urls_input",
+            height=120,
         )
         compare_pages = st.slider(
-            "Max pages", 1, 10, 3,
+            "Max pages per company", 1, 10, 3,
             key="compare_pages_slider",
             help="Each page = ~20 reviews",
         )
-        add_clicked = st.button("➕ Add company", use_container_width=True, type="primary")
+        add_clicked = st.button("➕ Add companies", use_container_width=True, type="primary")
+
+        # Parse URLs from text area — one per line, strip blanks
+        compare_urls = [u.strip() for u in compare_urls_input.splitlines() if u.strip()] if compare_urls_input else []
 
         st.markdown("---")
-        if st.session_state.compare_companies:
-            st.markdown("**Companies added:**")
-            for i, co in enumerate(st.session_state.compare_companies):
-                ccol1, ccol2 = st.columns([3, 1])
-                ccol1.caption(f"📍 {co['name']} ({co['review_count']} reviews)")
-                if ccol2.button("✕", key=f"remove_{i}"):
-                    st.session_state.compare_companies.pop(i)
-                    st.rerun()
-
         if st.button("🗑️ Clear all", use_container_width=True,
                      disabled=not st.session_state.compare_companies):
             st.session_state.compare_companies = []
             st.rerun()
+        st.caption("Add/remove companies in the main view below.")
 
 
 # ─────────────────────────────────────────────
@@ -141,7 +142,7 @@ if app_mode == "🔍 Single Business":
 else:
     compare.render(
         add_clicked=add_clicked,
-        compare_url=compare_url,
+        compare_urls=compare_urls,
         compare_pages=compare_pages,
     )
 
