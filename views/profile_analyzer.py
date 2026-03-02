@@ -51,7 +51,7 @@ def render_profile_analysis(df: pd.DataFrame):
     ])
     
     with tab1:
-        render_reviewer_map(profiles_df)
+        render_reviewer_map(profiles_df, original_df=df)
     
     with tab2:
         render_reviewer_clusters(profiles_df)
@@ -75,12 +75,19 @@ def render_profile_analysis(df: pd.DataFrame):
         mime="text/csv",
     )
 
-def render_reviewer_map(profiles_df: pd.DataFrame):
-    """Render a scatter plot of reviewers in PCA space."""
+def render_reviewer_map(profiles_df: pd.DataFrame, original_df: pd.DataFrame = None):
+    """
+    Render a scatter plot of reviewers in PCA space.
+    Now includes sample reviews in hover tooltips.
+    
+    Args:
+        profiles_df: DataFrame with reviewer profiles
+        original_df: Original reviews DataFrame to pull sample reviews from
+    """
     st.subheader("Reviewer Behavior Map")
     st.caption(
         "Each dot is a reviewer. Position reflects their review style, topic preferences, "
-        "and sentiment patterns. Size = number of reviews."
+        "and sentiment patterns. Size = number of reviews. **Hover over any dot to see their reviews!**"
     )
     
     if "reviewer_pca_x" not in profiles_df.columns:
@@ -89,11 +96,71 @@ def render_reviewer_map(profiles_df: pd.DataFrame):
     
     fig = go.Figure()
     
+    # Prepare hover data for each reviewer
+    hover_texts = []
+    custom_data = []
+    
+    for _, reviewer in profiles_df.iterrows():
+        reviewer_name = reviewer["reviewer_name"]
+        
+        # Get sample reviews from this reviewer
+        sample_reviews_text = ""
+        if original_df is not None and "reviewer_name" in original_df.columns:
+            reviewer_reviews = original_df[original_df["reviewer_name"] == reviewer_name]
+            if not reviewer_reviews.empty:
+                # Get 3 sample reviews with sentiment
+                samples = []
+                for _, review in reviewer_reviews.head(3).iterrows():
+                    sentiment = review["sentiment_score"]
+                    sentiment_emoji = "🟢" if sentiment > 0.05 else ("🔴" if sentiment < -0.05 else "🟡")
+                    review_text = str(review["review_text"])[:100] + "..." if len(str(review["review_text"])) > 100 else str(review["review_text"])
+                    samples.append(f"{sentiment_emoji} {review_text}")
+                
+                if samples:
+                    sample_reviews_text = "<br>".join(samples)
+                else:
+                    sample_reviews_text = "No review samples available"
+            else:
+                sample_reviews_text = "No review samples available"
+        else:
+            # Fall back to sample_reviews column if it exists
+            if "sample_reviews" in reviewer.index and reviewer["sample_reviews"]:
+                samples = []
+                for review_text in reviewer["sample_reviews"][:3]:
+                    if review_text and isinstance(review_text, str):
+                        review_preview = review_text[:100] + "..." if len(review_text) > 100 else review_text
+                        samples.append(f"💬 {review_preview}")
+                sample_reviews_text = "<br>".join(samples) if samples else "No sample reviews"
+            else:
+                sample_reviews_text = "No sample reviews available"
+        
+        # Create hover text with reviewer info and sample reviews
+        hover_text = (
+            f"<b>{reviewer_name}</b><br>"
+            f"📊 Reviews: {reviewer['total_reviews']}<br>"
+            f"📈 Avg sentiment: {reviewer['avg_sentiment']:+.2f}<br>"
+            f"📝 Avg length: {reviewer['avg_review_length_words']:.0f} words<br>"
+            f"<br><b>Sample reviews:</b><br>{sample_reviews_text}"
+        )
+        hover_texts.append(hover_text)
+        
+        # Store additional data for customdata if needed
+        custom_data.append([
+            reviewer["avg_sentiment"],
+            reviewer["avg_review_length_words"],
+            reviewer["total_reviews"]
+        ])
+    
     # Color by cluster if available
     if "reviewer_cluster" in profiles_df.columns:
         for cluster_id in sorted(profiles_df["reviewer_cluster"].unique()):
             cluster_df = profiles_df[profiles_df["reviewer_cluster"] == cluster_id]
             cluster_name = name_reviewer_cluster(cluster_df)
+            
+            # Get indices for this cluster to subset hover_texts
+            cluster_indices = cluster_df.index
+            cluster_hover_texts = [hover_texts[i] for i in cluster_indices]
+            cluster_custom_data = [custom_data[i] for i in cluster_indices]
             
             fig.add_trace(go.Scatter(
                 x=cluster_df["reviewer_pca_x"],
@@ -107,14 +174,13 @@ def render_reviewer_map(profiles_df: pd.DataFrame):
                     line=dict(width=1, color="white"),
                 ),
                 text=cluster_df["reviewer_name"],
-                hovertemplate=(
-                    "<b>%{text}</b><br>" +
-                    "Reviews: %{marker.size:.0f}<br>" +
-                    "Avg sentiment: %{customdata[0]:.2f}<br>" +
-                    "Avg length: %{customdata[1]} words<br>" +
-                    "<extra></extra>"
-                ),
-                customdata=cluster_df[["avg_sentiment", "avg_review_length_words"]].values,
+                hovertemplate="%{customdata[3]}<extra></extra>",  # Use the pre-formatted hover text
+                customdata=list(zip(
+                    cluster_df["avg_sentiment"],
+                    cluster_df["avg_review_length_words"],
+                    cluster_df["total_reviews"],
+                    cluster_hover_texts  # Include the formatted hover text
+                )),
             ))
     else:
         fig.add_trace(go.Scatter(
@@ -131,12 +197,13 @@ def render_reviewer_map(profiles_df: pd.DataFrame):
                 line=dict(width=1, color="white"),
             ),
             text=profiles_df["reviewer_name"],
-            hovertemplate=(
-                "<b>%{text}</b><br>" +
-                "Reviews: %{marker.size:.0f}<br>" +
-                "Avg sentiment: %{marker.color:.2f}<br>" +
-                "<extra></extra>"
-            ),
+            hovertemplate="%{customdata[3]}<extra></extra>",
+            customdata=list(zip(
+                profiles_df["avg_sentiment"],
+                profiles_df["avg_review_length_words"],
+                profiles_df["total_reviews"],
+                hover_texts
+            )),
         ))
     
     # Get variance from separate columns
@@ -144,7 +211,7 @@ def render_reviewer_map(profiles_df: pd.DataFrame):
     variance_pc2 = profiles_df["pca_variance_pc2"].iloc[0] if "pca_variance_pc2" in profiles_df.columns and len(profiles_df) > 0 else 0
     
     fig.update_layout(
-        height=500,
+        height=600,
         xaxis=dict(
             title=f"PC1 ({variance_pc1:.0%} variance)" if variance_pc1 else "PC1",
             showgrid=False,
@@ -155,12 +222,21 @@ def render_reviewer_map(profiles_df: pd.DataFrame):
             showgrid=False,
             zeroline=False,
         ),
-        hoverlabel=dict(bgcolor="white", font_size=12),
+        hoverlabel=dict(
+            bgcolor="white",
+            font_size=12,
+            font_family="monospace",
+            bordercolor="#ddd",
+            namelength=-1  # Allow long text to wrap
+        ),
         legend=dict(orientation="h", y=-0.15),
-        margin=dict(t=20, b=40),
+        margin=dict(t=20, b=40, l=20, r=20),
     )
     
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Add instructions
+    st.caption("💡 **Tip:** Hover over any dot to see the reviewer's profile and sample reviews. Click and drag to zoom, double-click to reset.")
 
 
 def render_reviewer_clusters(profiles_df: pd.DataFrame):

@@ -21,23 +21,100 @@ from views.components import COLORS
 def extract_reviewer_profiles(df: pd.DataFrame) -> pd.DataFrame:
     """
     Extract reviewer information from a dataframe of reviews.
-    If reviewer_name column exists, use it to identify unique reviewers.
-    For Trustpilot scraped data, this would need to be extended to scrape
-    individual profile pages.
+    
+    IMPORTANT: Without real reviewer identifiers, we treat each review as
+    coming from a unique reviewer. This avoids falsely grouping different
+    people together.
+    
+    If reviewer_name column exists (from Trustpilot), use it to identify
+    real unique reviewers.
     """
-    # For now, create synthetic reviewer IDs if none exist
-    if "reviewer_name" not in df.columns:
-        # Generate synthetic reviewer IDs based on email patterns or anonymized IDs
-        np.random.seed(42)
-        n_reviewers = max(1, len(df) // 3)  # Assume each reviewer wrote ~3 reviews on avg
-        reviewer_ids = np.random.choice(range(n_reviewers), size=len(df))
-        df = df.copy()
-        df["reviewer_id"] = reviewer_ids
-        df["reviewer_name"] = [f"Reviewer_{i}" for i in reviewer_ids]
-    else:
+    df = df.copy()
+    
+    # Check if we have real reviewer names (from Trustpilot)
+    if "reviewer_name" in df.columns:
+        # Use real reviewer names as identifiers
         df["reviewer_id"] = df["reviewer_name"]
+        
+        # Count how many real repeat reviewers we have
+        unique_reviewers = df["reviewer_name"].nunique()
+        total_reviews = len(df)
+        repeat_rate = (total_reviews - unique_reviewers) / total_reviews * 100
+        
+        print(f"📊 Found {unique_reviewers} unique reviewers across {total_reviews} reviews")
+        print(f"📈 Repeat reviewer rate: {repeat_rate:.1f}%")
+        
+    else:
+        # No real reviewer data - treat each review as unique
+        # This is honest and avoids false groupings
+        df["reviewer_id"] = range(len(df))
+        df["reviewer_name"] = [f"Review_{i}" for i in range(len(df))]
+        
+        print("⚠️ No reviewer names found - treating each review as a unique reviewer")
+        print("   Profile analysis will show per-review patterns, not per-person patterns")
     
     return df
+
+
+def analyze_reviewers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main function to analyze all reviewers in a dataset.
+    Returns a dataframe with one row per reviewer and their profile metrics.
+    
+    Note: If no real reviewer identifiers exist, each review is treated as
+    its own "reviewer" to avoid false groupings.
+    """
+    # Ensure we have reviewer IDs (honestly assigned)
+    df = extract_reviewer_profiles(df)
+    
+    # Check if we're using real reviewer data or synthetic unique IDs
+    using_real_data = "reviewer_name" in df.columns and df["reviewer_name"].nunique() < len(df)
+    
+    reviewer_profiles = []
+    
+    for reviewer_id, group in df.groupby("reviewer_id"):
+        reviewer_name = group["reviewer_name"].iloc[0]
+        
+        # Basic stats
+        profile = {
+            "reviewer_id": reviewer_id,
+            "reviewer_name": reviewer_name,
+            "total_reviews": len(group),
+            "is_repeat_reviewer": len(group) > 1,  # Flag for real repeat reviewers
+            "first_review_date": group["date"].min() if "date" in group.columns else None,
+            "last_review_date": group["date"].max() if "date" in group.columns else None,
+        }
+        
+        # Add style metrics
+        style_metrics = get_reviewer_style_metrics(group["review_text"])
+        profile.update(style_metrics)
+        
+        # Add topic preferences
+        topic_prefs = get_reviewer_topic_preferences(group["review_text"])
+        for topic, score in topic_prefs.items():
+            profile[f"topic_{topic}"] = score
+        
+        # Add sentiment profile
+        sentiment_profile = get_reviewer_sentiment_profile(group)
+        profile.update(sentiment_profile)
+        
+        # Store sample reviews
+        sample_reviews = group.nlargest(3, "sentiment_score")["review_text"].tolist() + \
+                         group.nsmallest(2, "sentiment_score")["review_text"].tolist()
+        profile["sample_reviews"] = sample_reviews[:3]
+        
+        reviewer_profiles.append(profile)
+    
+    result_df = pd.DataFrame(reviewer_profiles)
+    
+    # Add a note about data quality
+    if not using_real_data:
+        result_df.attrs["data_quality"] = "synthetic"
+        result_df.attrs["warning"] = "No real reviewer identifiers - each review treated as unique"
+    else:
+        result_df.attrs["data_quality"] = "real"
+    
+    return result_df
 
 
 def get_reviewer_style_metrics(reviews_series: pd.Series) -> dict:
