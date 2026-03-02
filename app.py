@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from pipeline import run_pipeline, make_sample_data, THEME_KEYWORDS
+from pipeline import run_pipeline, make_sample_data, THEME_KEYWORDS, compute_elbow_data, compute_data_quality, export_results_csv
 
 # ─────────────────────────────────────────────
 # Page config
@@ -92,14 +92,33 @@ with st.sidebar:
     st.caption("Understand what your customers are really saying.")
     st.markdown("---")
 
-    n_clusters = st.slider("Number of themes to find", min_value=2, max_value=8, value=5)
+    # Use session_state to detect if user has manually touched the slider
+    if "k_override" not in st.session_state:
+        st.session_state.k_override = False
+
+    def on_slider_change():
+        st.session_state.k_override = True
+
+    n_clusters = st.slider(
+        "Number of themes",
+        min_value=2, max_value=8, value=5,
+        key="n_clusters_slider",
+        on_change=on_slider_change,
+        help="Auto-selects optimal K via elbow analysis until you move this slider."
+    )
+
+    if st.session_state.k_override:
+        if st.button("↩️ Reset to auto", use_container_width=True):
+            st.session_state.k_override = False
+            # Button click triggers rerun automatically — no need for st.rerun()
 
     st.markdown("---")
     st.markdown("**Data source**")
     data_source = st.radio(
         "Choose source",
         ["Sample data", "Scrape Trustpilot", "Upload CSV"],
-        label_visibility="collapsed"
+        label_visibility="collapsed",
+        key="data_source_radio",
     )
 
     trustpilot_url = None
@@ -108,21 +127,23 @@ with st.sidebar:
     business_name = "Luigi's Bistro"
 
     if data_source == "Sample data":
-        business_name = st.text_input("Business name", value="Luigi's Bistro")
+        business_name = st.text_input("Business name", value="Luigi's Bistro", key="sample_business_name")
 
     elif data_source == "Scrape Trustpilot":
         trustpilot_url = st.text_input(
             "Trustpilot URL or slug",
             placeholder="e.g. dominos.com",
-            help="Paste a full URL like https://www.trustpilot.com/review/dominos.com or just the slug"
+            help="Paste a full URL like https://www.trustpilot.com/review/dominos.com or just the slug",
+            key="trustpilot_url_input",
         )
         max_pages = st.slider("Max pages to scrape", 1, 20, 5,
-                              help="Each page has ~20 reviews. More pages = slower but richer analysis.")
+                              help="Each page has ~20 reviews. More pages = slower but richer analysis.",
+                              key="max_pages_slider")
         st.caption("🕐 ~1 second per page")
 
     elif data_source == "Upload CSV":
-        business_name = st.text_input("Business name", placeholder="e.g. Mario's Pizzeria")
-        uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+        business_name = st.text_input("Business name", placeholder="e.g. Mario's Pizzeria", key="csv_business_name")
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader")
         st.caption("Required column: `review_text`\nOptional: `rating`")
 
 
@@ -194,11 +215,86 @@ elif data_source == "Upload CSV":
 st.markdown(f"# {business_name}")
 st.caption("Customer review analysis — powered by clustering & sentiment")
 
-with st.spinner("Analyzing reviews..."):
-    df, summaries, pca_meta = get_results(raw_df.to_json(), n_clusters)
+# ─────────────────────────────────────────────
+# Data quality report
+# ─────────────────────────────────────────────
+
+quality = compute_data_quality(raw_df)
+
+with st.expander("📋 Data Quality Report", expanded=False):
+    qcol1, qcol2, qcol3, qcol4 = st.columns(4)
+    qcol1.metric("Raw reviews", f"{quality['total_raw']:,}")
+    qcol2.metric("After cleaning", f"{quality['total_clean']:,}",
+                 delta=f"-{quality['total_dropped']} dropped" if quality["total_dropped"] else "✓ none dropped",
+                 delta_color="off" if quality["total_dropped"] else "normal")
+    qcol3.metric("Avg review length", f"{quality['avg_length']} chars")
+    qcol4.metric("Median review length", f"{quality['median_length']} chars")
+
+    st.markdown("")
+    dcol1, dcol2, dcol3 = st.columns(3)
+    dcol1.metric("Very short reviews (<50 chars)", quality["short_reviews"],
+                 help="These may not contain enough signal for analysis")
+    dcol2.metric("Long reviews (>500 chars)", quality["long_reviews"],
+                 help="Rich in detail — good signal for clustering")
+    if quality["has_ratings"] and quality["rating_stats"]:
+        rs = quality["rating_stats"]
+        dcol3.metric("Avg rating", f"{rs['avg_rating']} ★",
+                     help=f"5★: {rs['pct_5_star']}%  |  1★: {rs['pct_1_star']}%")
+
+    if quality["date_range"]:
+        st.caption(f"📅 Reviews span {quality['date_range']['earliest']} → {quality['date_range']['latest']}")
+
+    if quality["null_text"] > 0:
+        st.warning(f"⚠️ {quality['null_text']} reviews had no text and were removed.")
+    if quality["empty_text"] > 0:
+        st.warning(f"⚠️ {quality['empty_text']} reviews were too short (<10 chars) and were removed.")
+    if quality["total_dropped"] == 0:
+        st.success("✅ All reviews passed quality checks — no data dropped.")
 
 # ─────────────────────────────────────────────
-# Top-level metrics
+# Elbow analysis + main pipeline
+# Strategy: run signals-only pass first (cached), use it for elbow,
+# then run full pipeline once with the optimal K.
+# ─────────────────────────────────────────────
+
+@st.cache_data
+def get_signals_only(df_json: str) -> str:
+    """Run load + extract_signals only — no clustering. Returns processed df as JSON."""
+    from pipeline import load_data, extract_signals
+    df = pd.read_json(df_json)
+    df = load_data(df)
+    df = extract_signals(df)
+    return df.to_json()
+
+@st.cache_data
+def get_elbow_data(processed_df_json: str) -> dict:
+    """Run elbow analysis on already-processed df (theme cols present)."""
+    df = pd.read_json(processed_df_json)
+    return compute_elbow_data(df)
+
+# Step 1: extract signals (fast after first run — cached)
+with st.spinner("Extracting signals from reviews..."):
+    processed_json = get_signals_only(raw_df.to_json())
+
+# Step 2: find optimal K
+elbow_result = get_elbow_data(processed_json)
+optimal_k = elbow_result["suggested_k"]
+
+# Step 3: let user override, but default to optimal
+auto_mode = not st.session_state.get("k_override", False)
+final_k = optimal_k if auto_mode else n_clusters
+
+# Step 4: run full pipeline with final K
+with st.spinner(f"Clustering into {final_k} themes..."):
+    df, summaries, pca_meta = get_results(raw_df.to_json(), final_k)
+
+if auto_mode:
+    st.caption(f"🎯 Auto-selected **K = {final_k}** clusters via elbow analysis. Move the sidebar slider to override.")
+else:
+    st.caption(f"🎯 Using **K = {final_k}** clusters — set manually. Elbow analysis recommends K = {optimal_k}.")
+
+# ─────────────────────────────────────────────
+# Top-level metrics + download button
 # ─────────────────────────────────────────────
 
 total_reviews = len(df)
@@ -207,12 +303,21 @@ pct_positive = (df["sentiment_label"] == "Positive").mean() * 100
 pct_negative = (df["sentiment_label"] == "Negative").mean() * 100
 has_ratings = "rating" in df.columns and df["rating"].notna().any()
 
-cols = st.columns(4 if has_ratings else 3)
-cols[0].metric("Total Reviews", f"{total_reviews:,}")
-cols[1].metric("Positive", f"{pct_positive:.0f}%")
-cols[2].metric("Negative", f"{pct_negative:.0f}%")
+metric_cols = st.columns([1, 1, 1, 1, 1.2])
+metric_cols[0].metric("Total Reviews", f"{total_reviews:,}")
+metric_cols[1].metric("Positive", f"{pct_positive:.0f}%")
+metric_cols[2].metric("Negative", f"{pct_negative:.0f}%")
 if has_ratings:
-    cols[3].metric("Avg Star Rating", f"{df['rating'].mean():.1f} ★")
+    metric_cols[3].metric("Avg Star Rating", f"{df['rating'].mean():.1f} ★")
+
+# CSV download button
+csv_data = export_results_csv(df, summaries)
+metric_cols[4].download_button(
+    label="⬇️ Download Results CSV",
+    data=csv_data,
+    file_name=f"{business_name.lower().replace(' ', '_')}_review_analysis.csv",
+    mime="text/csv",
+)
 
 st.markdown("---")
 
@@ -220,7 +325,7 @@ st.markdown("---")
 # Tabs
 # ─────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["📦 Theme Clusters", "🗺️ Review Map", "📈 Sentiment Breakdown"])
+tab1, tab2, tab3, tab4 = st.tabs(["📦 Theme Clusters", "🗺️ Review Map", "📈 Sentiment Breakdown", "🔬 Pipeline Analysis"])
 
 # ════════════════════════════════════════════
 # TAB 1: Cluster cards
@@ -456,8 +561,103 @@ with tab3:
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
+
+# ════════════════════════════════════════════
+# TAB 4: Pipeline Analysis
+# ════════════════════════════════════════════
+
+with tab4:
+    st.subheader("Optimal Number of Clusters")
+    st.caption("Computed by running K-Means for K=2 to K=8 and measuring cluster quality.")
+
+    elbow = elbow_result  # already computed above — reuse cached result
+
+    # Recommended K callout
+    rec_col1, rec_col2 = st.columns(2)
+    rec_col1.success(f"✅ **Using K = {elbow['elbow_k']}** (elbow method)  \n"
+                     f"The point where adding more clusters gives diminishing returns.")
+    rec_col2.info(f"📊 **Best silhouette score at K = {elbow['silhouette_k']}**  \n"
+                  f"Measures how well-separated clusters are from each other.")
+
+    ecol1, ecol2 = st.columns(2)
+
+    # Elbow curve — inertia
+    with ecol1:
+        fig_elbow = go.Figure()
+        fig_elbow.add_trace(go.Scatter(
+            x=elbow["k_values"], y=elbow["inertias"],
+            mode="lines+markers",
+            line=dict(color="#2980b9", width=2),
+            marker=dict(size=8, color="#2980b9"),
+            name="Inertia",
+        ))
+        # Highlight elbow K
+        elbow_idx = elbow["k_values"].index(elbow["elbow_k"])
+        fig_elbow.add_trace(go.Scatter(
+            x=[elbow["elbow_k"]], y=[elbow["inertias"][elbow_idx]],
+            mode="markers", marker=dict(size=14, color="#c0392b", symbol="star"),
+            name=f"Elbow (K={elbow['elbow_k']})",
+        ))
+        fig_elbow.update_layout(
+            title="Inertia vs K (Elbow Curve)",
+            xaxis_title="Number of Clusters (K)",
+            yaxis_title="Inertia (lower = tighter clusters)",
+            height=320, template="plotly_white",
+            font_family="Source Sans 3", paper_bgcolor="#faf8f5",
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_elbow, use_container_width=True)
+
+    # Silhouette score chart
+    with ecol2:
+        sil_colors = [
+            "#27ae60" if k == elbow["silhouette_k"] else "#bdc3c7"
+            for k in elbow["k_values"]
+        ]
+        fig_sil = go.Figure()
+        fig_sil.add_trace(go.Bar(
+            x=elbow["k_values"], y=elbow["silhouettes"],
+            marker_color=sil_colors,
+            text=[f"{s:.3f}" for s in elbow["silhouettes"]],
+            textposition="outside",
+            name="Silhouette Score",
+        ))
+        fig_sil.update_layout(
+            title="Silhouette Score vs K (higher = better)",
+            xaxis_title="Number of Clusters (K)",
+            yaxis_title="Silhouette Score",
+            height=320, template="plotly_white",
+            font_family="Source Sans 3", paper_bgcolor="#faf8f5",
+            yaxis=dict(range=[0, max(elbow["silhouettes"]) * 1.2]),
+        )
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    st.caption(
+        "**Inertia** measures how tightly packed reviews are within each cluster — lower is better, "
+        "but always decreases as K increases. The **elbow point** is where the curve bends. "
+        "**Silhouette score** measures how well-separated clusters are from each other — higher is better."
+    )
+
+    # PCA variance breakdown table
+    st.subheader("PCA Variance Breakdown")
+    st.caption(f"K-Means ran on {pca_meta['n_cluster_components']} PCA components "
+               f"capturing {pca_meta['variance_cluster']:.0%} of total variance. "
+               f"The 2D chart shows {pca_meta['variance_2d']:.0%}.")
+
+    variance_data = pd.DataFrame({
+        "Component":          ["Component 1 (X axis)", "Component 2 (Y axis)", "Components 3+", "Total (clustering)"],
+        "Variance Explained": [
+            f"{pca_meta['variance_x']:.1%}",
+            f"{pca_meta['variance_y']:.1%}",
+            f"{pca_meta['variance_cluster'] - pca_meta['variance_2d']:.1%}",
+            f"{pca_meta['variance_cluster']:.1%}",
+        ],
+        "Used for":           ["Visualization", "Visualization", "Clustering only", "Clustering"],
+    })
+    st.dataframe(variance_data, use_container_width=True, hide_index=True)
+
 # ─────────────────────────────────────────────
 # Footer
 # ─────────────────────────────────────────────
 st.markdown("---")
-st.caption("Review Aggregator · Built with Streamlit, scikit-learn & VADER")
+st.caption("Review Aggregator · Built with Streamlit, scikit-learn & DistilBERT")

@@ -316,6 +316,123 @@ def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
 
 
 # ─────────────────────────────────────────────
+# Elbow analysis
+# ─────────────────────────────────────────────
+
+def compute_elbow_data(source, k_min: int = 2, k_max: int = 8) -> dict:
+    """Try K values k_min..k_max, return inertia, silhouette scores, suggested K."""
+    from sklearn.metrics import silhouette_score
+
+    df = load_data(source)
+    # Only run extract_signals if theme columns aren't already present
+    theme_cols = list(THEME_KEYWORDS.keys())
+    if not all(c in df.columns for c in theme_cols):
+        df = extract_signals(df)
+    X, _ = vectorize_reviews(df)
+
+    n_components = min(10, X.shape[0] - 1, X.shape[1] - 1)
+    pca = PCA(n_components=n_components, random_state=42)
+    X_reduced = pca.fit_transform(X)
+
+    k_max = min(k_max, len(df) - 1)
+    k_values, inertias, silhouettes = [], [], []
+
+    for k in range(k_min, k_max + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = km.fit_predict(X_reduced)
+        inertias.append(km.inertia_)
+        sil = silhouette_score(X_reduced, labels) if len(set(labels)) > 1 else 0.0
+        silhouettes.append(round(sil, 4))
+        k_values.append(k)
+
+    silhouette_k = k_values[int(np.argmax(silhouettes))]
+    if len(inertias) >= 3:
+        deltas = np.diff(inertias)
+        second_deriv = np.diff(deltas)
+        elbow_k = k_values[1:-1][int(np.argmax(second_deriv))]
+    else:
+        elbow_k = silhouette_k
+
+    return {
+        "k_values":     k_values,
+        "inertias":     inertias,
+        "silhouettes":  silhouettes,
+        "suggested_k":  elbow_k,   # elbow method is the primary recommendation
+        "elbow_k":      elbow_k,
+        "silhouette_k": silhouette_k,
+    }
+
+
+# ─────────────────────────────────────────────
+# Data quality report
+# ─────────────────────────────────────────────
+
+def compute_data_quality(raw_df: pd.DataFrame) -> dict:
+    """Analyse raw dataframe before cleaning and return a quality report."""
+    total_raw = len(raw_df)
+    null_text  = raw_df["review_text"].isna().sum() if "review_text" in raw_df.columns else 0
+    empty_text = int((raw_df["review_text"].astype(str).str.strip().str.len() <= 10).sum())                  if "review_text" in raw_df.columns else 0
+    total_dropped = int(null_text) + empty_text
+
+    texts = raw_df["review_text"].dropna().astype(str)
+    lengths = texts.str.len()
+    avg_length    = int(lengths.mean())    if len(lengths) else 0
+    median_length = int(lengths.median()) if len(lengths) else 0
+    short_reviews = int((lengths < 50).sum())
+    long_reviews  = int((lengths > 500).sum())
+
+    has_ratings = "rating" in raw_df.columns
+    rating_stats = {}
+    if has_ratings:
+        ratings = pd.to_numeric(raw_df["rating"], errors="coerce").dropna()
+        rating_stats = {
+            "avg_rating":      round(float(ratings.mean()), 2),
+            "pct_5_star":      round((ratings == 5).mean() * 100, 1),
+            "pct_1_star":      round((ratings == 1).mean() * 100, 1),
+            "missing_ratings": int(raw_df["rating"].isna().sum()),
+        }
+
+    date_range = None
+    if "date" in raw_df.columns:
+        dates = pd.to_datetime(raw_df["date"], errors="coerce").dropna()
+        if len(dates):
+            date_range = {"earliest": str(dates.min().date()), "latest": str(dates.max().date())}
+
+    return {
+        "total_raw":     total_raw,
+        "total_clean":   total_raw - total_dropped,
+        "total_dropped": total_dropped,
+        "null_text":     int(null_text),
+        "empty_text":    empty_text,
+        "avg_length":    avg_length,
+        "median_length": median_length,
+        "short_reviews": short_reviews,
+        "long_reviews":  long_reviews,
+        "has_ratings":   has_ratings,
+        "rating_stats":  rating_stats,
+        "date_range":    date_range,
+    }
+
+
+# ─────────────────────────────────────────────
+# Export helper
+# ─────────────────────────────────────────────
+
+def export_results_csv(df: pd.DataFrame, summaries: list) -> str:
+    """Return CSV string of review-level data with cluster labels and scores attached."""
+    id_to_name = {s["cluster_id"]: s["name"] for s in summaries}
+    export_df = df.copy()
+    export_df["cluster_name"] = export_df["cluster"].map(id_to_name)
+
+    priority_cols = ["review_text", "rating", "cluster_name", "sentiment_score",
+                     "sentiment_label"] + list(THEME_KEYWORDS.keys())
+    other_cols = [c for c in export_df.columns
+                  if c not in priority_cols and c not in ("cluster", "pca_x", "pca_y")]
+    ordered = [c for c in priority_cols if c in export_df.columns] + other_cols
+    return export_df[ordered].to_csv(index=False)
+
+
+# ─────────────────────────────────────────────
 # Full pipeline
 # ─────────────────────────────────────────────
 
@@ -342,6 +459,7 @@ def make_sample_data() -> pd.DataFrame:
     reviews = [
         # Food quality
         ("The pasta was absolutely incredible, fresh and full of flavor. Best I've had in years!", 5),
+        ("Food was cold when it arrived and completely bland. Really disappointing meal.", 2),
         ("Delicious dishes, the salmon was cooked perfectly. Generous portions too.", 5),
         ("The burger was dry and overcooked. The fries were soggy. Won't order again.", 1),
         ("Fresh ingredients, amazing taste. The chef clearly knows what they're doing.", 5),
